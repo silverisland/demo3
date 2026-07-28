@@ -58,6 +58,7 @@ MINUTES_PER_POINT = 15
 # Set CAPACITY_COL to the real scalar capacity column when it exists.
 CAPACITY_COL: Optional[str] = None
 DEFAULT_CAPACITY = 500.0
+SCORE_CAPACITY = 465.0
 HISTORY_RATIO_CLIP = (0.0, 1.2)
 PREDICTION_RATIO_CLIP = (0.0, 1.05)
 
@@ -663,6 +664,60 @@ def calculate_metrics(
     }
 
 
+def calculate_monthly_score(
+    prediction_frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, float]:
+    """Reproduce the daily-RMSE monthly score from the original script."""
+    data = prediction_frame.copy()
+    data["date"] = pd.to_datetime(data["timestamp"]).dt.normalize()
+    data["squared_error"] = (
+        data["prediction_power"] - data["target_power"]
+    ) ** 2
+
+    daily_result = (
+        data.groupby("date", as_index=False)["squared_error"]
+        .mean()
+        .rename(columns={"squared_error": "mse_final_pred"})
+    )
+    daily_result["rmse_final_pred"] = np.sqrt(
+        daily_result["mse_final_pred"]
+    )
+    daily_result["month"] = daily_result["date"].dt.month
+
+    monthly_rows = []
+    score_list = []
+
+    for month in range(1, 13):
+        month_data = daily_result[daily_result["month"] == month]
+        if month_data.empty:
+            print(f"{month} month score post process: no data")
+            continue
+
+        mean_daily_rmse = float(
+            month_data["rmse_final_pred"].mean()
+        )
+        score = 1.0 - mean_daily_rmse / SCORE_CAPACITY
+        print(f"{month} month score post process: {score:.4f}")
+
+        monthly_rows.append(
+            {
+                "month": month,
+                "mean_daily_rmse": mean_daily_rmse,
+                "score": score,
+            }
+        )
+        score_list.append(score)
+
+    score_mean = (
+        float(np.mean(score_list))
+        if score_list
+        else float("nan")
+    )
+    print(f"score mean: {score_mean:.4f}")
+
+    return pd.DataFrame(monthly_rows), score_mean
+
+
 def evaluate(
     model: EncoderTabM,
     loader: DataLoader,
@@ -850,6 +905,14 @@ def main() -> None:
         index=False,
     )
 
+    monthly_scores, monthly_score_mean = calculate_monthly_score(
+        prediction_frame
+    )
+    monthly_scores.to_csv(
+        OUTPUT_DIR / "monthly_scores.csv",
+        index=False,
+    )
+
     station_metric_rows = []
     for station, group in prediction_frame.groupby(
         "station",
@@ -874,6 +937,8 @@ def main() -> None:
         "best_epoch": best_checkpoint["epoch"],
         "validation": best_checkpoint["validation_metrics"],
         "test": test_metrics,
+        "monthly_score_mean": monthly_score_mean,
+        "score_capacity": SCORE_CAPACITY,
     }
     with open(
         OUTPUT_DIR / "metrics.json",

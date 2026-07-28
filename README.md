@@ -66,7 +66,12 @@ python encoder_tabm4pv.py
 - `future_covariate_transformer.joblib`
 - `test_predictions.parquet`
 - `test_metrics_by_station.csv`
+- `monthly_scores.csv`
 - `metrics.json`
+
+`monthly_scores.csv` 复现原始 `tabm4pv.py` 的评分方式：先计算每天的
+功率 RMSE，再计算每月 `1 - mean_daily_rmse / SCORE_CAPACITY`，最后对有
+测试数据的月份取平均。默认 `SCORE_CAPACITY = 465.0`。
 
 第一轮建议保持：
 
