@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/
+.venv/
+.pixi/
+outputs/
+*.pt
+*.joblib
+*.parquet
