@@ -61,8 +61,14 @@ TRAIN_START = pd.Timestamp("2024-01-01 00:00:00")
 TRAIN_END = pd.Timestamp("2024-12-31 23:59:59")
 TEST_START = pd.Timestamp("2025-01-01 00:00:00")
 TEST_END = pd.Timestamp("2025-12-31 23:59:59")
-MAPPING_START = TRAIN_START
-MAPPING_END = TRAIN_END
+
+# Use source data from the same season as the target calibration period.
+# The target period may contain only two or three weeks. Target power labels
+# are never used to build the template or to train TabM.
+SOURCE_MAPPING_START = pd.Timestamp("2024-12-01 00:00:00")
+SOURCE_MAPPING_END = pd.Timestamp("2024-12-31 23:59:59")
+TARGET_MAPPING_START = pd.Timestamp("2024-12-10 00:00:00")
+TARGET_MAPPING_END = pd.Timestamp("2024-12-31 23:59:59")
 
 HISTORY_WINDOW_HOURS = 24
 POINT_PER_HOUR = 4
@@ -83,6 +89,7 @@ HISTORY_LAST_OFFSET_MINUTES = 0
 PREDICTION_CLIP_LOWER = 0.0
 PREDICTION_CLIP_UPPER_RATIO = 1.2
 SCORE_CAPACITY = 465.0
+SAVE_PREDICTIONS = False
 
 
 def array_target(values):
@@ -159,6 +166,8 @@ def process_single_file(df, station, station_warp):
     )
 
     for col_fut in FU_COV_COLUMNS:
+        # Weather remains the forecast at the real physical target time.
+        # Only the time-of-day coordinate below is mapped to canonical time.
         target_values = df[col_fut].map(array_target)
         processed_dfs.append(
             pd.DataFrame(
@@ -172,6 +181,8 @@ def process_single_file(df, station, station_warp):
         )
 
     target_power = df[TARGET_COL].map(array_target)
+    # Registration changes the time coordinate, not the power value. Therefore
+    # the TabM label only needs capacity normalization and no decoder target.
     processed_dfs.append(
         pd.DataFrame(
             {
@@ -275,8 +286,10 @@ station_warps = pv_curve_registration.fit_station_warps(
     source_stations,
     TARGET_STATION,
     STATION_CAPACITY,
-    MAPPING_START,
-    MAPPING_END,
+    SOURCE_MAPPING_START,
+    SOURCE_MAPPING_END,
+    TARGET_MAPPING_START,
+    TARGET_MAPPING_END,
     timestamp_col=TIMESTAMP_COL,
     power_history_col=PV_COL,
     history_last_offset_minutes=HISTORY_LAST_OFFSET_MINUTES,
@@ -609,10 +622,11 @@ capacity = test_dataset["capacity"].to_numpy()
 test_dataset = test_dataset.copy()
 test_dataset["groundtruth"] = groundtruth_ratio * capacity
 test_dataset["prediction"] = prediction_ratio * capacity
-test_dataset.to_parquet(
-    "best_prediction_registered_tabm.parquet",
-    index=False,
-)
+if SAVE_PREDICTIONS:
+    test_dataset.to_parquet(
+        "best_prediction_registered_tabm.parquet",
+        index=False,
+    )
 
 
 def rmse(y_true, y_pred):

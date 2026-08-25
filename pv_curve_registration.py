@@ -8,17 +8,26 @@ from scipy.optimize import minimize
 POINT_PER_HOUR = 4
 POINTS_PER_DAY = 24 * POINT_PER_HOUR
 
-MIN_OBSERVATIONS_PER_SLOT = 10
-N_WARP_KNOTS = 9
-MIN_KNOT_GAP = 0.025
-IDENTITY_PENALTY = 0.015
-SMOOTHNESS_PENALTY = 0.010
+MIN_VALID_SLOTS_PER_DAY = 72
+MIN_SELECTED_DAYS = 5
+USE_HIGH_ENERGY_DAYS = True
+HIGH_ENERGY_DAY_FRACTION = 0.40
+
+N_WARP_KNOTS = 5
+MAX_TIME_SHIFT_HOURS = 1.0
+MIN_LOCAL_SLOPE = 0.75
+MAX_LOCAL_SLOPE = 1.33
+IDENTITY_PENALTY = 0.10
+SMOOTHNESS_PENALTY = 0.05
+GRADIENT_LOSS_WEIGHT = 0.20
 DAYLIGHT_THRESHOLD = 0.02
-N_TEMPLATE_ITERATIONS = 3
+N_TEMPLATE_ITERATIONS = 2
+MIN_ALIGNMENT_IMPROVEMENT = 0.01
 
 CURVE_GRID = np.arange(POINTS_PER_DAY, dtype=np.float64) / POINTS_PER_DAY
 CANONICAL_KNOTS = np.linspace(0.0, 1.0, N_WARP_KNOTS)
 MINUTES_PER_DAY = 24.0 * 60.0
+MAX_SHIFT_FRACTION = MAX_TIME_SHIFT_HOURS / 24.0
 
 
 def _last_value(values):
@@ -48,22 +57,51 @@ def _median_curve(
         + pd.to_timedelta(history_last_offset_minutes, unit="m")
     )
     power = data[power_history_col].map(_last_value) / capacity
-    slot = timestamp.dt.hour * POINT_PER_HOUR
-    slot += timestamp.dt.minute // 15
-
-    samples = pd.DataFrame({"slot": slot, "power": power}).dropna()
-    grouped = samples.groupby("slot")["power"]
-    curve = grouped.median().reindex(np.arange(POINTS_PER_DAY))
-    count = grouped.count().reindex(np.arange(POINTS_PER_DAY), fill_value=0)
-    curve[count < MIN_OBSERVATIONS_PER_SLOT] = np.nan
-    curve = curve.interpolate(limit_direction="both")
-
-    if curve.isna().any():
+    samples = pd.DataFrame(
+        {
+            "date": timestamp.dt.date,
+            "slot": (
+                timestamp.dt.hour * POINT_PER_HOUR
+                + timestamp.dt.minute // 15
+            ),
+            "power": power,
+        }
+    ).dropna()
+    daily = samples.pivot_table(
+        index="date",
+        columns="slot",
+        values="power",
+        aggfunc="median",
+    ).reindex(columns=np.arange(POINTS_PER_DAY))
+    daily = daily[daily.notna().sum(axis=1) >= MIN_VALID_SLOTS_PER_DAY]
+    daily = daily.interpolate(axis=1, limit_direction="both").dropna()
+    if len(daily) < MIN_SELECTED_DAYS:
         raise ValueError(
-            "The median curve contains NaN. Check timestamp coverage or "
-            "reduce MIN_OBSERVATIONS_PER_SLOT."
+            f"Only {len(daily)} valid days in the curve-registration period"
         )
-    return curve.to_numpy(dtype=np.float64)
+
+    if USE_HIGH_ENERGY_DAYS:
+        energy = daily.clip(lower=0.0).sum(axis=1)
+        n_selected = max(
+            MIN_SELECTED_DAYS,
+            int(np.ceil(len(daily) * HIGH_ENERGY_DAY_FRACTION)),
+        )
+        selected = energy.nlargest(min(n_selected, len(daily))).index
+        daily = daily.loc[selected]
+
+    return daily.median(axis=0).to_numpy(dtype=np.float64)
+
+
+def _normalize_shape(curve):
+    """Remove stable amplitude only while estimating the time mapping."""
+    curve = np.clip(np.asarray(curve, dtype=np.float64), 0.0, None)
+    daylight = curve > DAYLIGHT_THRESHOLD
+    if daylight.sum() < 8:
+        raise ValueError("Too few daylight points for shape normalization")
+    scale = float(np.quantile(curve[daylight], 0.95))
+    if not np.isfinite(scale) or scale <= 1e-8:
+        raise ValueError(f"Invalid P95 shape scale: {scale}")
+    return curve / scale, scale
 
 
 def apply_daily_warp(curve, source_knots):
@@ -115,6 +153,13 @@ def _fit_warp(curve, template):
         fit_loss = np.mean(
             (registered[daylight] - template[daylight]) ** 2
         )
+        gradient_loss = np.mean(
+            (
+                np.gradient(registered)[daylight]
+                - np.gradient(template)[daylight]
+            )
+            ** 2
+        )
         identity_loss = np.mean(
             (source_knots - CANONICAL_KNOTS) ** 2
         )
@@ -123,30 +168,82 @@ def _fit_warp(curve, template):
         )
         return (
             fit_loss
+            + GRADIENT_LOSS_WEIGHT * gradient_loss
             + IDENTITY_PENALTY * identity_loss
             + SMOOTHNESS_PENALTY * smoothness_loss
         )
+
+    def local_slopes(x):
+        return np.diff(unpack(x)) / np.diff(CANONICAL_KNOTS)
 
     result = minimize(
         objective,
         CANONICAL_KNOTS[1:-1],
         method="SLSQP",
         bounds=[
-            (MIN_KNOT_GAP, 1.0 - MIN_KNOT_GAP)
-            for _ in CANONICAL_KNOTS[1:-1]
+            (
+                max(0.0, knot - MAX_SHIFT_FRACTION),
+                min(1.0, knot + MAX_SHIFT_FRACTION),
+            )
+            for knot in CANONICAL_KNOTS[1:-1]
         ],
-        constraints={
-            "type": "ineq",
-            "fun": lambda x: np.diff(unpack(x)) - MIN_KNOT_GAP,
-        },
+        constraints=[
+            {
+                "type": "ineq",
+                "fun": lambda x: local_slopes(x) - MIN_LOCAL_SLOPE,
+            },
+            {
+                "type": "ineq",
+                "fun": lambda x: MAX_LOCAL_SLOPE - local_slopes(x),
+            },
+        ],
         options={"maxiter": 800, "ftol": 1e-11, "disp": False},
     )
-    if not result.success:
-        print(f"Warning: curve registration: {result.message}")
-
-    source_knots = unpack(result.x)
+    source_knots = (
+        unpack(result.x)
+        if result.success
+        else CANONICAL_KNOTS.copy()
+    )
     registered, source_position = apply_daily_warp(curve, source_knots)
-    return registered, source_position, source_knots
+    before = _alignment_rmse(curve, template)
+    after = _alignment_rmse(registered, template)
+    improvement = (before - after) / before if before > 0 else 0.0
+    accepted = bool(
+        result.success
+        and improvement >= MIN_ALIGNMENT_IMPROVEMENT
+    )
+    if not accepted:
+        source_knots = CANONICAL_KNOTS.copy()
+        registered, source_position = apply_daily_warp(
+            curve,
+            source_knots,
+        )
+        after = _alignment_rmse(registered, template)
+        improvement = (before - after) / before if before > 0 else 0.0
+
+    return {
+        "registered": registered,
+        "position": source_position,
+        "knots": source_knots,
+        "before": before,
+        "after": after,
+        "improvement": improvement,
+        "accepted": accepted,
+        "optimizer_success": bool(result.success),
+        "optimizer_message": str(result.message),
+    }
+
+
+def _alignment_rmse(curve, template):
+    daylight = (
+        (curve > DAYLIGHT_THRESHOLD)
+        | (template > DAYLIGHT_THRESHOLD)
+    )
+    if daylight.sum() < 8:
+        daylight = np.ones_like(template, dtype=bool)
+    return float(
+        np.sqrt(np.mean((curve[daylight] - template[daylight]) ** 2))
+    )
 
 
 def fit_station_warps(
@@ -154,8 +251,10 @@ def fit_station_warps(
     source_stations,
     target_station,
     station_capacity,
-    mapping_start,
-    mapping_end,
+    source_mapping_start,
+    source_mapping_end,
+    target_mapping_start,
+    target_mapping_end,
     timestamp_col="timestamp_win",
     power_history_col="observe_power",
     history_last_offset_minutes=0,
@@ -165,9 +264,16 @@ def fit_station_warps(
     to that fixed template.
     """
     stations = list(source_stations) + [target_station]
-    curves = {}
+    capacity_curves = {}
+    shape_curves = {}
+    shape_scales = {}
     for station in stations:
-        curves[station] = _median_curve(
+        mapping_start, mapping_end = (
+            (target_mapping_start, target_mapping_end)
+            if station == target_station
+            else (source_mapping_start, source_mapping_end)
+        )
+        capacity_curves[station] = _median_curve(
             station_frames[station],
             float(station_capacity[station]),
             mapping_start,
@@ -176,14 +282,17 @@ def fit_station_warps(
             power_history_col,
             history_last_offset_minutes,
         )
+        shape_curves[station], shape_scales[station] = _normalize_shape(
+            capacity_curves[station]
+        )
 
     template = np.median(
-        np.stack([curves[station] for station in source_stations]),
+        np.stack([shape_curves[station] for station in source_stations]),
         axis=0,
     )
     for i in range(N_TEMPLATE_ITERATIONS):
         registered = [
-            _fit_warp(curves[station], template)[0]
+            _fit_warp(shape_curves[station], template)["registered"]
             for station in source_stations
         ]
         new_template = np.median(np.stack(registered), axis=0)
@@ -197,25 +306,29 @@ def fit_station_warps(
     station_warps = {}
     print("\n[Curve registration]")
     for station in stations:
-        curve = curves[station]
-        registered, position, knots = _fit_warp(curve, template)
-        restored = inverse_daily_warp(registered, position)
-        daylight = (
-            (curve > DAYLIGHT_THRESHOLD)
-            | (template > DAYLIGHT_THRESHOLD)
+        fit = _fit_warp(shape_curves[station], template)
+        registered_capacity, position = apply_daily_warp(
+            capacity_curves[station],
+            fit["knots"],
         )
-        before = np.sqrt(
-            np.mean((curve[daylight] - template[daylight]) ** 2)
+        restored = inverse_daily_warp(registered_capacity, position)
+        roundtrip = np.sqrt(
+            np.mean((restored - capacity_curves[station]) ** 2)
         )
-        after = np.sqrt(
-            np.mean((registered[daylight] - template[daylight]) ** 2)
-        )
-        roundtrip = np.sqrt(np.mean((restored - curve) ** 2))
+        slopes = np.diff(fit["knots"]) / np.diff(CANONICAL_KNOTS)
+        max_shift = np.max(
+            np.abs(fit["knots"] - CANONICAL_KNOTS)
+        ) * MINUTES_PER_DAY
         print(
-            f"station={station:<20} before={before:.6f} "
-            f"after={after:.6f} roundtrip={roundtrip:.8f}"
+            f"station={station:<20} accepted={str(fit['accepted']):<5} "
+            f"P95={shape_scales[station]:.4f} "
+            f"before={fit['before']:.6f} after={fit['after']:.6f} "
+            f"improve={100.0 * fit['improvement']:.2f}% "
+            f"shift={max_shift:.1f}min "
+            f"slope=[{slopes.min():.3f}, {slopes.max():.3f}] "
+            f"roundtrip={roundtrip:.8f}"
         )
-        station_warps[station] = knots
+        station_warps[station] = fit["knots"]
 
     return station_warps
 
