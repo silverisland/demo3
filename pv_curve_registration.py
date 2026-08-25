@@ -418,17 +418,20 @@ def register_history(
     ).astype(np.float32)
 
 
-def physical_to_canonical_hour(timestamp, source_knots):
-    """Map a physical target timestamp to the common time-of-day coordinate."""
-    canonical_minutes = float(
+def physical_to_canonical_minutes(timestamp, source_knots):
+    """Map a physical timestamp to an absolute canonical minute."""
+    return float(
         _physical_to_canonical(
             _absolute_minutes(timestamp),
             source_knots,
         )
     )
-    canonical_timestamp = pd.to_datetime(canonical_minutes, unit="m")
-    return (
-        canonical_timestamp.hour
-        + canonical_timestamp.minute / 60.0
-        + canonical_timestamp.second / 3600.0
+
+
+def physical_to_canonical_hour(timestamp, source_knots):
+    """Map a physical timestamp to the common time-of-day coordinate."""
+    canonical_minutes = physical_to_canonical_minutes(
+        timestamp,
+        source_knots,
     )
+    return (canonical_minutes % MINUTES_PER_DAY) / 60.0

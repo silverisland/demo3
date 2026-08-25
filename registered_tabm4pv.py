@@ -76,10 +76,12 @@ TARGET_FUTURE_HOUR = 4
 INPUT_LEN = HISTORY_WINDOW_HOURS * POINT_PER_HOUR
 TARGET_INDEX = TARGET_FUTURE_HOUR * POINT_PER_HOUR - 1
 
-# Crop the nested arrays immediately after reading each parquet file. TabM
-# finally uses only 96 historical points, but two days are retained to leave
-# enough interpolation margin for the time warp.
-HISTORY_KEEP_DAYS = 2
+# Keep the physical 15-minute history by default. Nonlinear resampling changes
+# the meaning of recent lags and was harmful in the ultra-short-term task.
+REGISTER_POWER_HISTORY = False
+
+# Two days are needed only when nonlinear history registration is enabled.
+HISTORY_KEEP_DAYS = 2 if REGISTER_POWER_HISTORY else 1
 HISTORY_KEEP_POINTS = HISTORY_KEEP_DAYS * 24 * POINT_PER_HOUR
 FUTURE_KEEP_POINTS = TARGET_INDEX + 1
 
@@ -138,28 +140,37 @@ def process_single_file(df, station, station_warp):
         )
     )
 
-    registered_history = np.stack(
-        [
-            pv_curve_registration.register_history(
-                history,
-                ts,
-                capacity,
-                station_warp,
-                input_len=INPUT_LEN,
-                history_last_offset_minutes=(
-                    HISTORY_LAST_OFFSET_MINUTES
-                ),
-            )
-            for history, ts in zip(df[PV_COL], timestamp)
-        ]
-    )
+    if REGISTER_POWER_HISTORY:
+        power_history = np.stack(
+            [
+                pv_curve_registration.register_history(
+                    history,
+                    ts,
+                    capacity,
+                    station_warp,
+                    input_len=INPUT_LEN,
+                    history_last_offset_minutes=(
+                        HISTORY_LAST_OFFSET_MINUTES
+                    ),
+                )
+                for history, ts in zip(df[PV_COL], timestamp)
+            ]
+        )
+    else:
+        power_history = np.stack(
+            [
+                np.asarray(history, dtype=np.float32)[-INPUT_LEN:]
+                / capacity
+                for history in df[PV_COL]
+            ]
+        )
     history_columns = [
         f"{PV_COL}_lag_{i}"
         for i in range(INPUT_LEN, 0, -1)
     ]
     processed_dfs.append(
         pd.DataFrame(
-            registered_history,
+            power_history,
             columns=history_columns,
             index=df.index,
         )
@@ -198,16 +209,45 @@ def process_single_file(df, station, station_warp):
         TARGET_FUTURE_HOUR,
         unit="h",
     )
+    history_end_timestamp = timestamp + pd.to_timedelta(
+        HISTORY_LAST_OFFSET_MINUTES,
+        unit="m",
+    )
+    canonical_current_minutes = np.asarray(
+        [
+            pv_curve_registration.physical_to_canonical_minutes(
+                ts,
+                station_warp,
+            )
+            for ts in history_end_timestamp
+        ],
+        dtype=np.float64,
+    )
+    canonical_target_minutes = np.asarray(
+        [
+            pv_curve_registration.physical_to_canonical_minutes(
+                ts,
+                station_warp,
+            )
+            for ts in target_timestamp
+        ],
+        dtype=np.float64,
+    )
     processed_dfs.append(
         pd.DataFrame(
             {
-                "predict_hour": [
-                    pv_curve_registration.physical_to_canonical_hour(
-                        ts,
-                        station_warp,
-                    )
-                    for ts in target_timestamp
-                ],
+                # Keep the original physical target hour as a baseline feature.
+                "predict_hour": target_timestamp.dt.hour,
+                "canonical_current_hour": (
+                    canonical_current_minutes % (24.0 * 60.0)
+                ) / 60.0,
+                "canonical_target_hour": (
+                    canonical_target_minutes % (24.0 * 60.0)
+                ) / 60.0,
+                "canonical_horizon_hours": (
+                    canonical_target_minutes
+                    - canonical_current_minutes
+                ) / 60.0,
                 "predict_month": target_timestamp.dt.month,
             },
             index=df.index,
@@ -331,6 +371,15 @@ test_dataset = process_single_file(
     station_warps[TARGET_STATION],
 ).reset_index(drop=True)
 
+print("\n[Canonical forecast horizon]")
+for name, dataset in [("train", train_dataset), ("test", test_dataset)]:
+    horizon = dataset["canonical_horizon_hours"]
+    print(
+        f"{name:<5} min={horizon.min():.4f}h "
+        f"mean={horizon.mean():.4f}h "
+        f"max={horizon.max():.4f}h"
+    )
+
 x_columns = []
 for col in FU_COV_COLUMNS:
     x_columns.append(f"{col}_target")
@@ -338,7 +387,13 @@ x_columns += [
     f"{PV_COL}_lag_{i}"
     for i in range(INPUT_LEN, 0, -1)
 ]
-x_columns += ["predict_hour", "predict_month"]
+x_columns += [
+    "predict_hour",
+    "canonical_current_hour",
+    "canonical_target_hour",
+    "canonical_horizon_hours",
+    "predict_month",
+]
 y_columns = f"{TARGET_COL}_target"
 
 train_dataset = (
