@@ -62,6 +62,13 @@ TARGET_FUTURE_HOUR = 4
 INPUT_LEN = HISTORY_WINDOW_HOURS * POINT_PER_HOUR
 TARGET_INDEX = TARGET_FUTURE_HOUR * POINT_PER_HOUR - 1
 
+# Crop the nested arrays immediately after reading each parquet file. TabM
+# finally uses only 96 historical points, but two days are retained to leave
+# enough interpolation margin for the time warp.
+HISTORY_KEEP_DAYS = 2
+HISTORY_KEEP_POINTS = HISTORY_KEEP_DAYS * 24 * POINT_PER_HOUR
+FUTURE_KEEP_POINTS = TARGET_INDEX + 1
+
 # Set to -15 if observe_power[-1] is timestamp_win - 15 minutes.
 HISTORY_LAST_OFFSET_MINUTES = 0
 
@@ -75,6 +82,26 @@ def array_target(values):
     if len(values) <= TARGET_INDEX:
         return np.nan
     return float(values[TARGET_INDEX])
+
+
+def crop_history(values):
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if len(values) < INPUT_LEN:
+        raise ValueError(
+            f"History length {len(values)} is smaller than "
+            f"INPUT_LEN={INPUT_LEN}"
+        )
+    return values[-HISTORY_KEEP_POINTS:].copy()
+
+
+def crop_future(values):
+    values = np.asarray(values, dtype=np.float32).reshape(-1)
+    if len(values) < FUTURE_KEEP_POINTS:
+        raise ValueError(
+            f"Future length {len(values)} is smaller than "
+            f"FUTURE_KEEP_POINTS={FUTURE_KEEP_POINTS}"
+        )
+    return values[:FUTURE_KEEP_POINTS].copy()
 
 
 def process_single_file(df, station, station_warp):
@@ -174,6 +201,13 @@ def process_single_file(df, station, station_warp):
 station_frames = {}
 for file in sorted(Path(DATA_ROOT_PATH).glob(DATA_FILE_GLOB)):
     df = pd.read_parquet(file)
+
+    # Original rows contain seven days of history and two days of future
+    # values. Keep only the part used by curve registration and TabM.
+    df[PV_COL] = df[PV_COL].map(crop_history)
+    for column in [TARGET_COL] + FU_COV_COLUMNS:
+        df[column] = df[column].map(crop_future)
+
     df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL])
     station_values = df[STATION_COL].dropna().astype(str).unique()
     if len(station_values) != 1:
