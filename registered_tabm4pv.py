@@ -39,6 +39,14 @@ FU_COV_COLUMNS = [
     "WD_SOLARGIS_predict",
 ]
 
+# Read only columns used by curve registration, TabM, and evaluation.
+READ_COLUMNS = [
+    TIMESTAMP_COL,
+    STATION_COL,
+    PV_COL,
+    TARGET_COL,
+] + FU_COV_COLUMNS
+
 TARGET_STATION = "replace_with_target_station"
 SOURCE_STATIONS = None  # None means all stations except TARGET_STATION.
 INCLUDE_TARGET_IN_TRAIN = False
@@ -200,7 +208,10 @@ def process_single_file(df, station, station_warp):
 
 station_frames = {}
 for file in sorted(Path(DATA_ROOT_PATH).glob(DATA_FILE_GLOB)):
-    df = pd.read_parquet(file)
+    df = pd.read_parquet(
+        file,
+        columns=READ_COLUMNS,
+    )
 
     # Original rows contain seven days of history and two days of future
     # values. Keep only the part used by curve registration and TabM.
